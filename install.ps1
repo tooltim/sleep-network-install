@@ -1,5 +1,10 @@
 # Sleep Network installer (Windows). Idempotent: safe to run again.
-param([switch]$Check, [string]$Passphrase, [string]$Name, [string]$Email, [ValidateSet('claude','codex','both','none')][string]$Assistant)
+# No parameter attributes here: the script is piped into Invoke-Expression, which validates attributes
+# against empty defaults and fails. Modes come from environment variables instead.
+#   SLEEPNET_MODE=check   only report what is installed
+#   SLEEPNET_NAME / SLEEPNET_EMAIL / SLEEPNET_PASSPHRASE / SLEEPNET_ASSISTANT(claude|codex|both|none)  skip the prompts
+$Check = ($env:SLEEPNET_MODE -eq 'check')
+$Passphrase = $env:SLEEPNET_PASSPHRASE; $Name = $env:SLEEPNET_NAME; $Email = $env:SLEEPNET_EMAIL; $Assistant = $env:SLEEPNET_ASSISTANT
 
 $ErrorActionPreference = 'Stop'
 $Repo = 'https://github.com/tooltim/sleep-network.git'
@@ -15,6 +20,7 @@ function Winget-Install($id, $label) {
 }
 
 Write-Host ""; Write-Host "Sleep Network installer" -ForegroundColor Cyan; Write-Host ""
+$ProgressPreference = 'SilentlyContinue'
 
 if ($Check) {
     foreach ($c in 'git', 'node', 'claude', 'codex', 'python') { if (Have $c) { Ok "$c found" } else { Say "$c missing" } }
@@ -51,6 +57,7 @@ if (-not $Assistant) {
     $a = Read-Host "  Which assistant do you use? [1] Claude Code  [2] Codex  [3] both  [4] already installed"
     $Assistant = @{ '1' = 'claude'; '2' = 'codex'; '3' = 'both'; '4' = 'none' }[$a]; if (-not $Assistant) { $Assistant = 'none' }
 }
+if ($Assistant -notin 'claude','codex','both','none') { $Assistant = 'none' }
 if (($Assistant -eq 'claude' -or $Assistant -eq 'both') -and -not (Have 'claude')) { Say "installing Claude Code…"; Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression }
 if (($Assistant -eq 'codex' -or $Assistant -eq 'both') -and -not (Have 'codex')) { Say "installing Codex…"; npm install -g @openai/codex | Out-Null }
 
