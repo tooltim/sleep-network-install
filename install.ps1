@@ -136,13 +136,86 @@ function Winget-Install($id, $label) {
     # Python (and anything else): winget-only; caller checks Have/Resolve afterward.
 }
 
+# Capture native git/gh output under Continue so stderr does not become a terminating NativeCommandError.
+function Invoke-NativeCapture {
+    param([string]$Exe, [string[]]$ArgList)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $raw = @(& $Exe @ArgList 2>&1)
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($null -eq $code) { $code = 0 }
+    $lines = @($raw | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
+    })
+    return @{ ExitCode = $code; Text = ($lines -join "`n"); Lines = $lines }
+}
+
+function Show-PrivateRepoAuthHelp {
+    Write-Host ""
+    Say "tooltim/sleep-network is a PRIVATE GitHub repo — clone fails with 'Repository not found' if you lack access or are not signed in."
+    Say "Fix, then re-run this installer:"
+    Say "  1. Ask Tim to invite your GitHub account to https://github.com/tooltim/sleep-network"
+    Say "  2. Sign in on this PC (preferred):  gh auth login"
+    Say "     Or approve the Git Credential Manager / browser prompt when Git asks."
+    Say "  3. Confirm access:  gh auth status"
+    Say "     and:  git ls-remote https://github.com/tooltim/sleep-network.git"
+    Say "  4. If a half-downloaded folder exists, delete it:  $Dest"
+    Write-Host ""
+}
+
+function Ensure-GitHubAuthReady {
+    # Prefer gh + Git Credential Manager so private clone does not silently look like success.
+    if (Have 'gh') {
+        $st = Invoke-NativeCapture 'gh' @('auth', 'status')
+        if ($st.ExitCode -eq 0) {
+            $setup = Invoke-NativeCapture 'gh' @('auth', 'setup-git')
+            if ($setup.ExitCode -ne 0 -and $setup.Text) { Say "gh auth setup-git: $($setup.Text)" }
+            Ok "GitHub CLI authenticated"
+            return
+        }
+        Say "GitHub CLI found but not logged in — starting gh auth login (browser)…"
+        Say "Use the same GitHub account Tim invited to tooltim/sleep-network."
+        $login = Invoke-NativeCapture 'gh' @('auth', 'login', '-h', 'github.com', '-p', 'https', '-w')
+        if ($login.Lines) { $login.Lines | ForEach-Object { if ($_) { Write-Host $_ } } }
+        if ($login.ExitCode -eq 0) {
+            $null = Invoke-NativeCapture 'gh' @('auth', 'setup-git')
+            Ok "GitHub CLI authenticated"
+            return
+        }
+        Say "gh auth login did not finish (exit $($login.ExitCode)). Git may still prompt via Credential Manager during clone."
+        return
+    }
+    Say "Tip: for reliable private-repo access, install GitHub CLI (winget install --id GitHub.cli -e --source winget) then run: gh auth login"
+    Say "Otherwise Git Credential Manager may open a browser during clone — sign in with an account that has access to tooltim/sleep-network."
+}
+
+function Resolve-SleepmagCli($dest) {
+    foreach ($rel in @((Join-Path 'tools' (Join-Path 'sleepmag' 'cli.mjs')), 'tools\sleepmag\cli.mjs', 'tools/sleepmag/cli.mjs')) {
+        $candidate = Join-Path $dest $rel
+        if (Test-Path -LiteralPath $candidate) {
+            try { return (Resolve-Path -LiteralPath $candidate).Path } catch { return $candidate }
+        }
+    }
+    return $null
+}
+
+function Test-WorkspaceComplete($dest) {
+    $gitOk = Test-Path -LiteralPath (Join-Path $dest '.git')
+    $cliOk = [bool](Resolve-SleepmagCli $dest)
+    return ($gitOk -and $cliOk)
+}
+
 Write-Host ""; Write-Host "Sleep Network installer" -ForegroundColor Cyan; Write-Host ""
 $ProgressPreference = 'SilentlyContinue'
 
 if ($Check) {
     Refresh-Path
     foreach ($c in 'git', 'node', 'claude', 'codex', 'python') { if (Have $c) { Ok "$c found" } else { Say "$c missing" } }
-    Say ("workspace: " + $(if (Test-Path (Join-Path $Dest 'sleepmag.cmd')) { 'present' } else { 'not installed' }))
+    Say ("workspace: " + $(if (Test-WorkspaceComplete $Dest) { 'present' } else { 'not installed' }))
     exit 0
 }
 
@@ -165,27 +238,51 @@ Ok ("node " + (& $nodeExe --version))
 if (-not (Have 'python')) { Winget-Install 'Python.Python.3.12' 'python.org' }
 if (Have 'python') { Ok "python present (used to repair the server allowlist)" } else { Say "python missing: the automatic IP-allowlist repair will not work until Python is installed (winget install Python.Python.3.12)" }
 
-# 2. Workspace
-if (-not (Test-Path (Join-Path $Dest '.git'))) {
+# 2. Workspace (must succeed before assistants / identity / sleepmag setup)
+Ensure-GitHubAuthReady
+$gitDir = Join-Path $Dest '.git'
+if (-not (Test-Path -LiteralPath $gitDir)) {
+    # Prior failed clone can leave an empty/incomplete folder; remove so git clone can retry cleanly.
+    if (Test-Path -LiteralPath $Dest) {
+        Say "removing incomplete workspace folder at $Dest…"
+        Remove-Item -LiteralPath $Dest -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Say "downloading the workspace into $Dest (a GitHub login window may open: use your GitHub account)…"
-    & $gitExe clone -q $Repo $Dest
-} else { Say "workspace already present, updating…"; & $gitExe -C $Dest pull -q --ff-only }
+    $gitOp = Invoke-NativeCapture $gitExe @('clone', $Repo, $Dest)
+} else {
+    Say "workspace already present, updating…"
+    $gitOp = Invoke-NativeCapture $gitExe @('-C', $Dest, 'pull', '--ff-only')
+}
+if ($gitOp.ExitCode -ne 0) {
+    if ($gitOp.Text) {
+        $gitOp.Lines | ForEach-Object { if ($_) { Write-Host $_ } }
+    }
+    Show-PrivateRepoAuthHelp
+    throw "Git clone/pull of tooltim/sleep-network failed (exit $($gitOp.ExitCode)). Fix GitHub access and re-run; installer will not continue."
+}
 # Canonicalize Dest (OneDrive Documents redirects / junctions) so later CLI paths resolve reliably.
 if (Test-Path -LiteralPath $Dest) {
     try { $Dest = (Resolve-Path -LiteralPath $Dest).Path } catch { }
 }
+$setupCli = Resolve-SleepmagCli $Dest
+if (-not (Test-Path -LiteralPath (Join-Path $Dest '.git')) -or -not $setupCli) {
+    Show-PrivateRepoAuthHelp
+    $missing = if (-not $setupCli) { "tools\sleepmag\cli.mjs" } else { ".git" }
+    throw "Workspace incomplete at $Dest (missing $missing) after clone/pull. Delete that folder if it is partial, fix GitHub access to tooltim/sleep-network, and re-run."
+}
 Ok "workspace at $Dest"
 
-# 3. Assistant preference + optional install (before sleepmag setup so chosen CLIs are on PATH)
+# 3. Assistant preference + optional install (only after workspace is verified)
 # Claude/Codex are optional: missing must never abort install/setup.
 if (-not $Assistant) {
     $a = Read-Host "  Which assistant do you use? [1] Claude Code  [2] Codex  [3] both  [4] already installed / skip"
     $Assistant = @{ '1' = 'claude'; '2' = 'codex'; '3' = 'both'; '4' = 'none' }[$a]; if (-not $Assistant) { $Assistant = 'none' }
 }
 if ($Assistant -notin 'claude','codex','both','none') { $Assistant = 'none' }
+$claudeJustInstalled = $false
 if (($Assistant -eq 'claude' -or $Assistant -eq 'both') -and -not (Have 'claude')) {
     Say "installing Claude Code…"
-    try { Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression } catch { Say "Claude install skipped ($($_.Exception.Message))" }
+    try { Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression; $claudeJustInstalled = $true } catch { Say "Claude install skipped ($($_.Exception.Message))" }
     Refresh-Path
 }
 if (($Assistant -eq 'codex' -or $Assistant -eq 'both') -and -not (Have 'codex')) {
@@ -195,8 +292,14 @@ if (($Assistant -eq 'codex' -or $Assistant -eq 'both') -and -not (Have 'codex'))
 }
 if (($Assistant -eq 'claude' -or $Assistant -eq 'both') -and -not (Have 'claude')) { Say "claude not on PATH yet (optional — continuing)" }
 if (($Assistant -eq 'codex' -or $Assistant -eq 'both') -and -not (Have 'codex')) { Say "codex not on PATH yet (optional — continuing)" }
+if ($claudeJustInstalled -or (($Assistant -eq 'claude' -or $Assistant -eq 'both') -and (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.local\bin')))) {
+    $localBin = Join-Path $env:USERPROFILE '.local\bin'
+    if (Test-Path -LiteralPath $localBin) {
+        Say "note: if new terminals cannot find 'claude', add %USERPROFILE%\.local\bin to your User PATH (non-fatal for this install)"
+    }
+}
 
-# 4. Identity + passphrase + platform + shortcut + PATH (sleepmag setup)
+# 4. Identity + passphrase only after workspace + cli.mjs are verified present
 if (-not $Name)  { $Name  = Read-Host "  Your first name" }
 if (-not $Email) { $Email = Read-Host "  Your work e-mail" }
 $setupArgs = @('setup', '--name', $Name, '--email', $Email)
@@ -205,17 +308,10 @@ if (-not $Passphrase) {
     $Passphrase = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 }
 $setupArgs += @('--passphrase', $Passphrase)
-# Resolve cli.mjs under Dest (backslash/forward slash + OneDrive-safe absolute path).
-$setupCli = $null
-foreach ($rel in @((Join-Path 'tools' (Join-Path 'sleepmag' 'cli.mjs')), 'tools\sleepmag\cli.mjs', 'tools/sleepmag/cli.mjs')) {
-    $candidate = Join-Path $Dest $rel
-    if (Test-Path -LiteralPath $candidate) {
-        try { $setupCli = (Resolve-Path -LiteralPath $candidate).Path } catch { $setupCli = $candidate }
-        break
-    }
-}
+# Re-resolve cli.mjs (Dest may have been canonicalized); refuse setup if still missing.
+$setupCli = Resolve-SleepmagCli $Dest
 if (-not $setupCli) {
-    throw "sleepmag CLI not found at $(Join-Path $Dest (Join-Path 'tools' (Join-Path 'sleepmag' 'cli.mjs'))). Re-run after confirming GitHub access to tooltim/sleep-network, or delete the workspace folder and try again."
+    throw "sleepmag CLI not found at $(Join-Path $Dest (Join-Path 'tools' (Join-Path 'sleepmag' 'cli.mjs'))). Refusing to run setup. Confirm GitHub access to tooltim/sleep-network, delete the workspace folder if incomplete, and re-run."
 }
 $setupLog = Join-Path $env:TEMP 'sleepnet-setup.log'
 # Capture stdout+stderr without letting NativeCommandError terminate under $ErrorActionPreference=Stop.
