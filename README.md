@@ -4,6 +4,8 @@ Public because a teammate needs to be able to download it before they have acces
 It contains no secrets: it installs Git/Node/Python if missing, clones the **private** `tooltim/sleep-network`
 workspace (GitHub asks you to log in), and runs its setup (your name, e-mail, the team passphrase Tim gives you).
 
+**You need a GitHub invite to `tooltim/sleep-network`.** Without it, clone fails with `Repository not found` and the installer stops (it will not pretend the workspace is OK). Prefer `gh auth login` (or Git Credential Manager) before retrying.
+
 ## Install (Windows)
 
 Open **PowerShell** (Start menu → type PowerShell → Enter) and paste:
