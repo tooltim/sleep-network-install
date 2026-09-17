@@ -102,7 +102,27 @@ if (-not (Test-Path (Join-Path $Dest '.git'))) {
 } else { Say "workspace already present, updating…"; & $gitExe -C $Dest pull -q --ff-only }
 Ok "workspace at $Dest"
 
-# 3. Identity + passphrase + platform + shortcut + PATH (sleepmag setup)
+# 3. Assistant preference + optional install (before sleepmag setup so chosen CLIs are on PATH)
+# Claude/Codex are optional: missing must never abort install/setup.
+if (-not $Assistant) {
+    $a = Read-Host "  Which assistant do you use? [1] Claude Code  [2] Codex  [3] both  [4] already installed / skip"
+    $Assistant = @{ '1' = 'claude'; '2' = 'codex'; '3' = 'both'; '4' = 'none' }[$a]; if (-not $Assistant) { $Assistant = 'none' }
+}
+if ($Assistant -notin 'claude','codex','both','none') { $Assistant = 'none' }
+if (($Assistant -eq 'claude' -or $Assistant -eq 'both') -and -not (Have 'claude')) {
+    Say "installing Claude Code…"
+    try { Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression } catch { Say "Claude install skipped ($($_.Exception.Message))" }
+    Refresh-Path
+}
+if (($Assistant -eq 'codex' -or $Assistant -eq 'both') -and -not (Have 'codex')) {
+    Say "installing Codex…"
+    try { npm install -g @openai/codex | Out-Null } catch { Say "Codex install skipped ($($_.Exception.Message))" }
+    Refresh-Path
+}
+if (($Assistant -eq 'claude' -or $Assistant -eq 'both') -and -not (Have 'claude')) { Say "claude not on PATH yet (optional — continuing)" }
+if (($Assistant -eq 'codex' -or $Assistant -eq 'both') -and -not (Have 'codex')) { Say "codex not on PATH yet (optional — continuing)" }
+
+# 4. Identity + passphrase + platform + shortcut + PATH (sleepmag setup)
 if (-not $Name)  { $Name  = Read-Host "  Your first name" }
 if (-not $Email) { $Email = Read-Host "  Your work e-mail" }
 $setupArgs = @('setup', '--name', $Name, '--email', $Email)
@@ -111,17 +131,31 @@ if (-not $Passphrase) {
     $Passphrase = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 }
 $setupArgs += @('--passphrase', $Passphrase)
-& $nodeExe (Join-Path $Dest 'tools\sleepmag\cli.mjs') @setupArgs
-if ($LASTEXITCODE -ne 0) { throw "setup failed" }
-
-# 4. Assistant
-if (-not $Assistant) {
-    $a = Read-Host "  Which assistant do you use? [1] Claude Code  [2] Codex  [3] both  [4] already installed"
-    $Assistant = @{ '1' = 'claude'; '2' = 'codex'; '3' = 'both'; '4' = 'none' }[$a]; if (-not $Assistant) { $Assistant = 'none' }
+$setupCli = Join-Path $Dest 'tools\sleepmag\cli.mjs'
+$setupLog = Join-Path $env:TEMP 'sleepnet-setup.log'
+# Capture output first (do not pipe the native call) so $LASTEXITCODE stays sleepmag's exit code.
+$setupLines = @(& $nodeExe $setupCli @setupArgs 2>&1)
+$setupExit = $LASTEXITCODE
+$setupLines | ForEach-Object { Write-Host $_ }
+$setupText = ($setupLines | ForEach-Object { "$_" }) -join "`n"
+try { Set-Content -LiteralPath $setupLog -Value $setupText -Encoding UTF8 } catch { }
+if ($setupExit -ne 0) {
+    if (-not $setupText) { $setupText = '' }
+    # sleepmag prints "❌ Command not found: claude|codex" and currently exits non-zero even though assistants are optional.
+    $assistantMissOnly = [regex]::Matches($setupText, '(?im)Command not found:\s*(claude|codex)\b')
+    $scrubbed = [regex]::Replace($setupText, '(?im)^.*Command not found:\s*(claude|codex)\b.*\r?\n?', '')
+    $otherHardFail = $scrubbed -match '(?im)(Command not found:|❌|✖|\bfatal\b|\berror\b)'
+    $requiredOk = ($setupText -match '(?im)passphrase stored') -and ($setupText -match '(?im)platform')
+    if ($assistantMissOnly.Count -gt 0 -and -not $otherHardFail -and $requiredOk) {
+        $missed = @($assistantMissOnly | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } | Select-Object -Unique) -join ', '
+        Say "optional assistant CLI missing ($missed) — continuing (not required for setup)"
+        if (-not (Test-Path (Join-Path $Dest 'sleepmag.cmd'))) {
+            Say "note: sleepmag may have stopped before finishing the desktop shortcut/PATH; re-run after the sleepmag optional-assistant fix if the shortcut is missing"
+        }
+    } else {
+        throw "setup failed"
+    }
 }
-if ($Assistant -notin 'claude','codex','both','none') { $Assistant = 'none' }
-if (($Assistant -eq 'claude' -or $Assistant -eq 'both') -and -not (Have 'claude')) { Say "installing Claude Code…"; Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression }
-if (($Assistant -eq 'codex' -or $Assistant -eq 'both') -and -not (Have 'codex')) { Say "installing Codex…"; npm install -g @openai/codex | Out-Null }
 
 Write-Host ""
 Ok "Installed. Double-click 'Sleep Network' on your desktop."
