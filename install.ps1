@@ -13,25 +13,58 @@ $Dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'sleep-network'
 function Say($m) { Write-Host ("  " + $m) }
 function Ok($m) { Write-Host ("  OK  " + $m) -ForegroundColor Green }
 function Have($cmd) { return [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
+function Refresh-Path {
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:Path
+    # A program installed a second ago is often not on PATH of THIS shell yet: add the usual folders directly.
+    foreach ($d in @("$env:ProgramFiles
+odejs", "$env:LOCALAPPDATA\Programs
+odejs", "$env:ProgramFiles\Git\cmd", "$env:LOCALAPPDATA\Programs\Git\cmd", "$env:LOCALAPPDATA\Programs\Python\Python312", "$env:LOCALAPPDATA\Microsoft\WindowsApps", "$env:USERPROFILE\.localin")) {
+        if ((Test-Path $d) -and ($env:Path -notlike "*$d*")) { $env:Path = "$d;" + $env:Path }
+    }
+}
 function Winget-Install($id, $label) {
-    if (-not (Have 'winget')) { throw "winget is missing; install $label by hand (https://$label) and run this again." }
-    Say "installing $label…"; winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements | Out-Null
-    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (Have 'winget') {
+        Say "installing $label (a Windows admin prompt may appear: accept it)..."
+        winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements
+        Refresh-Path
+    }
+    if ($label -eq 'nodejs.org' -and -not (Have 'node')) {
+        # winget missing or failed: install Node from the official MSI directly.
+        Say "installing Node.js from nodejs.org..."
+        $msi = Join-Path $env:TEMP 'node-lts.msi'
+        Invoke-WebRequest 'https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi' -OutFile $msi
+        Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+        Refresh-Path
+    }
+    if ($label -eq 'git-scm.com' -and -not (Have 'git')) {
+        Say "installing Git from git-scm.com..."
+        $exe = Join-Path $env:TEMP 'git-setup.exe'
+        Invoke-WebRequest 'https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/Git-2.47.1-64-bit.exe' -OutFile $exe
+        Start-Process $exe -ArgumentList '/VERYSILENT /NORESTART' -Wait
+        Refresh-Path
+    }
 }
 
 Write-Host ""; Write-Host "Sleep Network installer" -ForegroundColor Cyan; Write-Host ""
 $ProgressPreference = 'SilentlyContinue'
 
 if ($Check) {
+    Refresh-Path
     foreach ($c in 'git', 'node', 'claude', 'codex', 'python') { if (Have $c) { Ok "$c found" } else { Say "$c missing" } }
     Say ("workspace: " + $(if (Test-Path (Join-Path $Dest 'sleepmag.cmd')) { 'present' } else { 'not installed' }))
     exit 0
 }
 
 # 1. Tools
-if (-not (Have 'git')) { Winget-Install 'Git.Git' 'git-scm.com' } ; Ok ("git " + ((git --version) -replace 'git version ', ''))
-if (-not (Have 'node')) { Winget-Install 'OpenJS.NodeJS.LTS' 'nodejs.org' } ; Ok ("node " + (node --version))
-if (-not (Have 'python')) { Winget-Install 'Python.Python.3.12' 'python.org' } ; Ok "python present (used to repair the server allowlist)"
+Refresh-Path
+if (-not (Have 'git')) { Winget-Install 'Git.Git' 'git-scm.com' }
+if (-not (Have 'git')) { throw "Git did not install. Close this window, open a NEW PowerShell and run the installer again; if it still fails, install Git from https://git-scm.com and retry." }
+Ok ("git " + ((git --version) -replace 'git version ', ''))
+if (-not (Have 'node')) { Winget-Install 'OpenJS.NodeJS.LTS' 'nodejs.org' }
+if (-not (Have 'node')) { throw "Node.js did not install. Close this window, open a NEW PowerShell and run the installer again; if it still fails, install Node LTS from https://nodejs.org and retry." }
+Ok ("node " + (node --version))
+if (-not (Have 'python')) { Winget-Install 'Python.Python.3.12' 'python.org' }
+if (Have 'python') { Ok "python present (used to repair the server allowlist)" } else { Say "python missing: the automatic IP-allowlist repair will not work until Python is installed (winget install Python.Python.3.12)" }
 
 # 2. Workspace
 if (-not (Test-Path (Join-Path $Dest '.git'))) {
@@ -49,7 +82,8 @@ if (-not $Passphrase) {
     $Passphrase = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 }
 $setupArgs += @('--passphrase', $Passphrase)
-& node (Join-Path $Dest 'tools\sleepmag\cli.mjs') @setupArgs
+$nodeExe = (Get-Command node).Source
+& $nodeExe (Join-Path $Dest 'tools\sleepmag\cli.mjs') @setupArgs
 if ($LASTEXITCODE -ne 0) { throw "setup failed" }
 
 # 4. Assistant
