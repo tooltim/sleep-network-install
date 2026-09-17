@@ -49,27 +49,91 @@ function Resolve-Exe($name) {
     foreach ($p in $candidates) { if (Test-Path $p) { return $p } }
     return $null
 }
+# Fresh MSI/EXE installs can lag a few seconds before files appear on disk / PATH.
+function Wait-For-Exe($name, $seconds) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    do {
+        $found = Resolve-Exe $name
+        if ($found) { return $found }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+function Test-IsAdmin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $p = New-Object Security.Principal.WindowsPrincipal($id)
+        return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
 function Winget-Install($id, $label) {
+    # Pin --source winget: the default msstore source often fails with cert errors (0x8a15005e) on locked-down PCs.
     if (Have 'winget') {
-        Say "installing $label (a Windows admin prompt may appear: accept it)..."
-        winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements
+        Say "installing $label via winget (a Windows admin prompt may appear: accept it)..."
+        try {
+            winget install --id $id -e --source winget --silent --accept-package-agreements --accept-source-agreements
+        } catch {
+            Say "winget install of $label reported an error ($($_.Exception.Message)); will try a direct download if needed"
+        }
         Refresh-Path
+        # Brief wait: winget can return before PATH/files are visible in this shell.
+        if ($label -eq 'nodejs.org') {
+            if (Wait-For-Exe 'node' 20) { return }
+        } elseif ($label -eq 'git-scm.com') {
+            if (Wait-For-Exe 'git' 20) { return }
+        } else {
+            # python.org etc. — caller re-checks Have
+            return
+        }
     }
-    if ($label -eq 'nodejs.org' -and -not (Resolve-Exe 'node')) {
+    if ($label -eq 'nodejs.org') {
+        if (Resolve-Exe 'node') { return }
         # winget missing or failed: install Node from the official MSI directly.
         Say "installing Node.js from nodejs.org..."
         $msi = Join-Path $env:TEMP 'node-lts.msi'
         Invoke-WebRequest 'https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi' -OutFile $msi
-        Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
-        Refresh-Path
+        # /qn needs elevation for Program Files; without admin msiexec often exits non-zero and installs nothing.
+        $msiArgs = "/i `"$msi`" /qn /norestart"
+        $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+        $code = $proc.ExitCode
+        # 0 = success, 3010 = success reboot required — both OK.
+        if ($null -eq $code) { $code = -1 }
+        if ($code -ne 0 -and $code -ne 3010) {
+            $hint = "msiexec exited with code $code."
+            if (-not (Test-IsAdmin)) {
+                $hint += " Quiet MSI install usually needs an elevated PowerShell (Run as administrator), or approve the UAC prompt if one appeared."
+            }
+            Say "Node.js MSI did not succeed ($hint)"
+            return
+        }
+        # Files can take a moment to appear after msiexec returns.
+        if (-not (Wait-For-Exe 'node' 45)) {
+            Say "Node.js MSI finished (exit $code) but node.exe was not found yet under Program Files or %LOCALAPPDATA%\Programs\nodejs"
+        }
+        return
     }
-    if ($label -eq 'git-scm.com' -and -not (Resolve-Exe 'git')) {
+    if ($label -eq 'git-scm.com') {
+        if (Resolve-Exe 'git') { return }
         Say "installing Git from git-scm.com..."
         $exe = Join-Path $env:TEMP 'git-setup.exe'
         Invoke-WebRequest 'https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/Git-2.47.1-64-bit.exe' -OutFile $exe
-        Start-Process $exe -ArgumentList '/VERYSILENT /NORESTART' -Wait
-        Refresh-Path
+        $proc = Start-Process $exe -ArgumentList '/VERYSILENT /NORESTART' -Wait -PassThru
+        $code = $proc.ExitCode
+        if ($null -eq $code) { $code = -1 }
+        if ($code -ne 0) {
+            $hint = "Git setup exited with code $code."
+            if (-not (Test-IsAdmin)) {
+                $hint += " If an admin/UAC prompt was declined, approve it next time or run PowerShell as administrator."
+            }
+            Say "Git installer did not succeed ($hint)"
+            return
+        }
+        if (-not (Wait-For-Exe 'git' 45)) {
+            Say "Git installer finished (exit $code) but git.exe was not found yet under the usual Git\cmd folders"
+        }
+        return
     }
+    # Python (and anything else): winget-only; caller checks Have/Resolve afterward.
 }
 
 Write-Host ""; Write-Host "Sleep Network installer" -ForegroundColor Cyan; Write-Host ""
@@ -86,11 +150,17 @@ if ($Check) {
 Refresh-Path
 $gitExe = Resolve-Exe 'git'
 if (-not $gitExe) { Winget-Install 'Git.Git' 'git-scm.com'; $gitExe = Resolve-Exe 'git' }
-if (-not $gitExe) { throw "Git did not install. Close this window, open a NEW PowerShell and run the installer again; if it still fails, install Git from https://git-scm.com and retry." }
+if (-not $gitExe) {
+    $adminHint = if (Test-IsAdmin) { '' } else { ' If an admin/UAC prompt was declined, open an elevated PowerShell (Run as administrator) and run the installer again.' }
+    throw ("Git did not install. Close this window, open a NEW PowerShell and run the installer again; if it still fails, install Git from https://git-scm.com and retry." + $adminHint)
+}
 Ok ("git " + ((& $gitExe --version) -replace 'git version ', ''))
 $nodeExe = Resolve-Exe 'node'
 if (-not $nodeExe) { Winget-Install 'OpenJS.NodeJS.LTS' 'nodejs.org'; $nodeExe = Resolve-Exe 'node' }
-if (-not $nodeExe) { throw "Node.js did not install. Close this window, open a NEW PowerShell and run the installer again; if it still fails, install Node LTS from https://nodejs.org and retry." }
+if (-not $nodeExe) {
+    $adminHint = if (Test-IsAdmin) { '' } else { ' If the MSI/winget step needs admin, close this window, open an elevated PowerShell (Run as administrator), and run the installer again.' }
+    throw ("Node.js did not install. Close this window, open a NEW PowerShell and run the installer again; if it still fails, install Node LTS from https://nodejs.org and retry." + $adminHint)
+}
 Ok ("node " + (& $nodeExe --version))
 if (-not (Have 'python')) { Winget-Install 'Python.Python.3.12' 'python.org' }
 if (Have 'python') { Ok "python present (used to repair the server allowlist)" } else { Say "python missing: the automatic IP-allowlist repair will not work until Python is installed (winget install Python.Python.3.12)" }
