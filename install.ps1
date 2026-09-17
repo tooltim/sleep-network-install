@@ -170,6 +170,10 @@ if (-not (Test-Path (Join-Path $Dest '.git'))) {
     Say "downloading the workspace into $Dest (a GitHub login window may open: use your GitHub account)…"
     & $gitExe clone -q $Repo $Dest
 } else { Say "workspace already present, updating…"; & $gitExe -C $Dest pull -q --ff-only }
+# Canonicalize Dest (OneDrive Documents redirects / junctions) so later CLI paths resolve reliably.
+if (Test-Path -LiteralPath $Dest) {
+    try { $Dest = (Resolve-Path -LiteralPath $Dest).Path } catch { }
+}
 Ok "workspace at $Dest"
 
 # 3. Assistant preference + optional install (before sleepmag setup so chosen CLIs are on PATH)
@@ -201,13 +205,36 @@ if (-not $Passphrase) {
     $Passphrase = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 }
 $setupArgs += @('--passphrase', $Passphrase)
-$setupCli = Join-Path $Dest 'tools\sleepmag\cli.mjs'
+# Resolve cli.mjs under Dest (backslash/forward slash + OneDrive-safe absolute path).
+$setupCli = $null
+foreach ($rel in @((Join-Path 'tools' (Join-Path 'sleepmag' 'cli.mjs')), 'tools\sleepmag\cli.mjs', 'tools/sleepmag/cli.mjs')) {
+    $candidate = Join-Path $Dest $rel
+    if (Test-Path -LiteralPath $candidate) {
+        try { $setupCli = (Resolve-Path -LiteralPath $candidate).Path } catch { $setupCli = $candidate }
+        break
+    }
+}
+if (-not $setupCli) {
+    throw "sleepmag CLI not found at $(Join-Path $Dest (Join-Path 'tools' (Join-Path 'sleepmag' 'cli.mjs'))). Re-run after confirming GitHub access to tooltim/sleep-network, or delete the workspace folder and try again."
+}
 $setupLog = Join-Path $env:TEMP 'sleepnet-setup.log'
-# Capture output first (do not pipe the native call) so $LASTEXITCODE stays sleepmag's exit code.
-$setupLines = @(& $nodeExe $setupCli @setupArgs 2>&1)
-$setupExit = $LASTEXITCODE
+# Capture stdout+stderr without letting NativeCommandError terminate under $ErrorActionPreference=Stop.
+# Node often writes warnings/progress to stderr even when setup succeeds; 2>&1 wraps those as ErrorRecords.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $setupRaw = @(& $nodeExe $setupCli @setupArgs 2>&1)
+    $setupExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+if ($null -eq $setupExit) { $setupExit = 0 }
+# Stringify ErrorRecords so soft-continue regex and the log see plain text, not ErrorRecord objects.
+$setupLines = @($setupRaw | ForEach-Object {
+    if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
+})
 $setupLines | ForEach-Object { Write-Host $_ }
-$setupText = ($setupLines | ForEach-Object { "$_" }) -join "`n"
+$setupText = ($setupLines -join "`n")
 try { Set-Content -LiteralPath $setupLog -Value $setupText -Encoding UTF8 } catch { }
 if ($setupExit -ne 0) {
     if (-not $setupText) { $setupText = '' }
