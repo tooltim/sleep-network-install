@@ -209,8 +209,99 @@ function Test-WorkspaceComplete($dest) {
     return ($gitOk -and $cliOk)
 }
 
+function Get-DesktopFolders {
+    # Prefer the real Desktop (may be OneDrive-redirected); also cover classic + OneDrive paths coworkers actually see.
+    $dirs = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @(
+        [Environment]::GetFolderPath('Desktop'),
+        [Environment]::GetFolderPath('CommonDesktopDirectory')
+    )) {
+        if ($p -and (Test-Path -LiteralPath $p)) { [void]$dirs.Add(((Resolve-Path -LiteralPath $p).Path)) }
+    }
+    foreach ($root in @($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial)) {
+        if (-not $root) { continue }
+        $od = Join-Path $root 'Desktop'
+        if (Test-Path -LiteralPath $od) {
+            try { [void]$dirs.Add(((Resolve-Path -LiteralPath $od).Path)) } catch { [void]$dirs.Add($od) }
+        }
+    }
+    $classic = Join-Path $env:USERPROFILE 'Desktop'
+    if (Test-Path -LiteralPath $classic) {
+        try { [void]$dirs.Add(((Resolve-Path -LiteralPath $classic).Path)) } catch { [void]$dirs.Add($classic) }
+    }
+    return @($dirs | Select-Object -Unique)
+}
+
+function Ensure-SleepmagCmd($dest) {
+    $cmdPath = Join-Path $dest 'sleepmag.cmd'
+    if (Test-Path -LiteralPath $cmdPath) {
+        try { return (Resolve-Path -LiteralPath $cmdPath).Path } catch { return $cmdPath }
+    }
+    # Do not depend on sleepmag setup having written the launcher (soft-continue / partial setup).
+    $lines = @(
+        '@echo off',
+        'setlocal',
+        'cd /d "%~dp0"',
+        'where node >nul 2>&1',
+        'if errorlevel 1 (',
+        '  echo Node.js not found on PATH. Re-run the Sleep Network installer.',
+        '  pause',
+        '  exit /b 1',
+        ')',
+        'node "tools\sleepmag\cli.mjs" %*'
+    )
+    Set-Content -LiteralPath $cmdPath -Value ($lines -join "`r`n") -Encoding ASCII
+    if (-not (Test-Path -LiteralPath $cmdPath)) {
+        throw "Could not create launcher at $cmdPath"
+    }
+    try { return (Resolve-Path -LiteralPath $cmdPath).Path } catch { return $cmdPath }
+}
+
+function New-SleepNetworkShortcut($targetCmd, $desktopDir) {
+    $lnkPath = Join-Path $desktopDir 'Sleep Network.lnk'
+    $shell = New-Object -ComObject WScript.Shell
+    $sc = $shell.CreateShortcut($lnkPath)
+    $sc.TargetPath = $targetCmd
+    $sc.WorkingDirectory = (Split-Path -Parent $targetCmd)
+    $sc.WindowStyle = 1
+    $sc.Description = 'Sleep Network'
+    $sc.Save()
+    if (-not (Test-Path -LiteralPath $lnkPath)) {
+        throw "shortcut file missing after Save: $lnkPath"
+    }
+    try { return (Resolve-Path -LiteralPath $lnkPath).Path } catch { return $lnkPath }
+}
+
+function Wait-OnInstallError {
+    if ($env:SLEEPNET_PAUSE_ON_ERROR -eq '1') {
+        Write-Host ""
+        Write-Host "  Press Enter to close this window..." -ForegroundColor Yellow
+        try { [void][Console]::ReadLine() } catch {
+            try { Read-Host "  Press Enter to close" | Out-Null } catch { Start-Sleep -Seconds 30 }
+        }
+    }
+}
+
+function Show-InstallFail($message, $detail) {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host "  FAIL  Sleep Network install did not finish" -ForegroundColor Red
+    Write-Host "============================================================" -ForegroundColor Red
+    if ($message) { Write-Host ("  " + $message) -ForegroundColor Red }
+    if ($detail) {
+        Write-Host ""
+        Write-Host $detail
+    }
+    Write-Host ""
+    Say "Screenshot this window and send it to Tim."
+    Say "Then fix the problem (or ask Tim) and re-run the installer."
+    Write-Host ""
+}
+
 Write-Host ""; Write-Host "Sleep Network installer" -ForegroundColor Cyan; Write-Host ""
 $ProgressPreference = 'SilentlyContinue'
+
+try {
 
 if ($Check) {
     Refresh-Path
@@ -342,15 +433,58 @@ if ($setupExit -ne 0) {
     if ($assistantMissOnly.Count -gt 0 -and -not $otherHardFail -and $requiredOk) {
         $missed = @($assistantMissOnly | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } | Select-Object -Unique) -join ', '
         Say "optional assistant CLI missing ($missed) — continuing (not required for setup)"
-        if (-not (Test-Path (Join-Path $Dest 'sleepmag.cmd'))) {
-            Say "note: sleepmag may have stopped before finishing the desktop shortcut/PATH; re-run after the sleepmag optional-assistant fix if the shortcut is missing"
-        }
     } else {
-        throw "setup failed"
+        $tail = ($setupLines | Select-Object -Last 30) -join "`n"
+        if (-not $tail) { $tail = '(no setup output captured — process may have crashed)' }
+        $logHint = if (Test-Path -LiteralPath $setupLog) { "`nFull log: $setupLog" } else { '' }
+        throw "sleepmag setup failed (exit $setupExit). Last output:`n$tail$logHint"
+    }
+}
+
+# 5. Always ensure launcher + desktop shortcut(s) — do not rely on sleepmag creating the .lnk.
+$launcher = Ensure-SleepmagCmd $Dest
+$createdLnks = @()
+$shortcutErrors = @()
+foreach ($desk in (Get-DesktopFolders)) {
+    try {
+        $lnk = New-SleepNetworkShortcut $launcher $desk
+        $createdLnks += $lnk
+        Ok "shortcut: $lnk"
+    } catch {
+        $shortcutErrors += "${desk}: $($_.Exception.Message)"
+        Say "could not create shortcut on $desk ($($_.Exception.Message))"
     }
 }
 
 Write-Host ""
-Ok "Installed. Double-click 'Sleep Network' on your desktop."
+if ($createdLnks.Count -gt 0) {
+    Ok "Installed."
+    foreach ($lnk in $createdLnks) {
+        Write-Host ("  Shortcut: " + $lnk) -ForegroundColor Green
+    }
+    Write-Host ("  Or run: " + $launcher) -ForegroundColor Cyan
+    Say "Double-click the Sleep Network shortcut, or run the path above."
+} else {
+    Write-Host "============================================================" -ForegroundColor Yellow
+    Write-Host "  WARN  Workspace is installed, but no desktop shortcut was created" -ForegroundColor Yellow
+    Write-Host "============================================================" -ForegroundColor Yellow
+    if ($shortcutErrors.Count -gt 0) {
+        foreach ($e in $shortcutErrors) { Say "shortcut error: $e" }
+    } else {
+        Say "No Desktop folder was found (checked GetFolderPath('Desktop'), OneDrive Desktop, and %USERPROFILE%\Desktop)."
+    }
+    Write-Host ("  Or run: " + $launcher) -ForegroundColor Cyan
+    Say "Do not look only on the Desktop — use the Or run path above (paste into File Explorer or a terminal)."
+}
 Say "First time only: the assistant asks you to log in with your own Claude / OpenAI account, and Claude asks you to trust the folder. Say yes to both."
 Write-Host ""
+
+} catch {
+    $errText = $_.Exception.Message
+    if (-not $errText) { $errText = "$_" }
+    $detail = $null
+    if ($_.ScriptStackTrace) { $detail = $_.ScriptStackTrace }
+    Show-InstallFail $errText $detail
+    Wait-OnInstallError
+    exit 1
+}
